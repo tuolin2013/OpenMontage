@@ -1,294 +1,558 @@
-"""Pipeline Runner - Starts and manages the background AI Agent for a project.
+"""Pipeline Runner — Deterministic LLM stage executor.
 
-This module launches Claude Code as a non-interactive headless subprocess.
-The agent receives a structured prompt that enforces batch/headless execution:
-no questions, no onboarding, no capability menus — just execute the stage and exit.
+Architecture: NO subprocess, NO CLI, NO agent interaction.
+Each stage is a single stateless HTTP request to the OpenAI-compatible
+Chat Completions API (right.codes gateway by default).
 
-Implementation note:
-On Windows, passing a long multi-line prompt as a CLI argument to `claude -p` is
-unreliable because the shell (cmd.exe) has a command-line length limit (~8191 chars)
-and may mangle newlines/quotes. Instead, we write the prompt to a temp file and
-pipe it into claude's stdin via the `-F` / `--input-file` flag, or via stdin pipe.
+Flow per stage:
+  1. Load pipeline YAML + stage definition
+  2. Load previous stage artifacts from checkpoint files
+  3. Build system prompt (role + JSON contract) + user message (brief + artifacts)
+  4. POST to /v1/chat/completions  (blocking, one request/response)
+  5. Parse JSON from response
+  6. Write artifact JSON + checkpoint JSON to disk
+  7. Return result dict — caller decides next action
+
+The stage runs in a background thread so the FastAPI endpoint returns immediately
+and the frontend polls /status + /log.
 """
 
-import subprocess
-import platform
-import tempfile
-import os
-import threading
-from pathlib import Path
-import logging
+from __future__ import annotations
 
-PROJECTS_DIR = Path(__file__).resolve().parent.parent / "projects"
-PIPELINE_DEFS_DIR = Path(__file__).resolve().parent.parent / "pipeline_defs"
+import json
+import logging
+import os
+import re
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
-def _wait_and_close(proc, *files):
-    proc.wait()
-    for f in files:
-        try:
-            f.close()
-        except Exception:
-            pass
+# ── Directory layout ──────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+PROJECTS_DIR = ROOT / "projects"
+PIPELINE_DEFS_DIR = ROOT / "pipeline_defs"
+PIPELINES_DIR = ROOT / "pipelines"   # checkpoint storage
+
+
+# ── Stage artifact schemas (inline — no external AI agent needed) ─────
+# Maps stage name → the JSON shape the LLM must return inside "artifacts"
+STAGE_ARTIFACT_CONTRACTS: dict[str, dict] = {
+    "research": {
+        "research_brief": {
+            "summary": "string — market research summary",
+            "competitors": ["list of competitor product names"],
+            "platform_trends": ["list of trend observations"],
+            "audience_profile": "string — target audience description",
+            "hook_patterns": ["list of effective hook patterns found"],
+            "key_insights": ["list of actionable insights"]
+        }
+    },
+    "proposal": {
+        "proposal_packet": {
+            "recommended_video_type": "string — e.g. 产品展示/种草测评/直播引流/品牌故事",
+            "duration_seconds": "number",
+            "target_platform": "string — e.g. 抖音/小红书/淘宝",
+            "core_selling_points": ["list of up to 3 selling points"],
+            "concept_options": [
+                {
+                    "id": "A",
+                    "angle": "string — selling angle",
+                    "visual_strategy": "string",
+                    "rationale": "string"
+                }
+            ],
+            "cost_estimate_usd": "number",
+            "render_runtime": "string — e.g. remotion/hyperframes"
+        }
+    },
+    "script": {
+        "script": {
+            "hook": "string — opening 3 seconds, grab attention",
+            "pain_point": "string — audience pain point addressed",
+            "product_intro": "string — product introduction",
+            "key_points": ["list of selling point lines"],
+            "cta": "string — call to action",
+            "full_script": "string — complete narration text",
+            "duration_estimate_seconds": "number",
+            "word_count": "number"
+        }
+    },
+    "scene_plan": {
+        "scene_plan": {
+            "scenes": [
+                {
+                    "scene_id": "number",
+                    "duration_seconds": "number",
+                    "shot_description": "string",
+                    "overlay_text": "string or null",
+                    "sound_note": "string or null",
+                    "is_product_closeup": "boolean"
+                }
+            ],
+            "total_duration_seconds": "number",
+            "product_closeup_ratio": "number 0-1"
+        }
+    },
+    "assets": {
+        "asset_manifest": {
+            "voiceover": {"text": "string", "voice": "string", "file_path": "string or null"},
+            "background_music": {"style": "string", "file_path": "string or null"},
+            "images": [{"scene_id": "number", "prompt": "string", "file_path": "string or null"}],
+            "subtitles_file": "string or null",
+            "notes": "string"
+        }
+    },
+    "edit": {
+        "edit_decisions": {
+            "timeline": [
+                {
+                    "scene_id": "number",
+                    "start_sec": "number",
+                    "end_sec": "number",
+                    "transition": "string — cut/fade/slide",
+                    "text_overlay": "string or null",
+                    "audio_level_db": "number"
+                }
+            ],
+            "total_duration_seconds": "number",
+            "bgm_volume_db": "number",
+            "render_runtime": "string"
+        }
+    },
+    "compose": {
+        "render_report": {
+            "status": "completed",
+            "output_file": "string — relative path to rendered video or HyperFrames composition",
+            "resolution": "string — e.g. 1080x1920",
+            "duration_seconds": "number",
+            "file_size_bytes": "number or null",
+            "render_notes": "string"
+        }
+    },
+    "publish": {
+        "publish_log": {
+            "platforms": [
+                {
+                    "name": "string",
+                    "video_file": "string",
+                    "title": "string",
+                    "description": "string",
+                    "tags": ["list of tags"],
+                    "cover_frame": "string or null"
+                }
+            ],
+            "status": "ready"
+        }
+    },
+}
+
+
+# ── Environment helpers ───────────────────────────────────────
+
+def _load_env() -> dict[str, str]:
+    """Read key=value pairs from .env file (strip inline comments)."""
+    env: dict[str, str] = {}
+    dotenv = ROOT / ".env"
+    if not dotenv.exists():
+        return env
+    for line in dotenv.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.split("#")[0].strip()
+        if k and v:
+            env[k] = v
+    return env
+
+
+def _get_llm_config() -> tuple[str, str, str]:
+    """Return (api_key, base_url, model) from env, falling back to .env file."""
+    file_env = _load_env()
+
+    api_key = (
+        os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+        or file_env.get("ANTHROPIC_API_KEY")
+        or file_env.get("LLM_API_KEY")
+        or ""
+    )
+    base_url = (
+        os.environ.get("ANTHROPIC_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or file_env.get("ANTHROPIC_BASE_URL")
+        or file_env.get("LLM_BASE_URL")
+        or "https://api.openai.com/v1"
+    )
+    model = (
+        os.environ.get("LLM_MODEL")
+        or file_env.get("LLM_MODEL")
+        or "claude-sonnet-4-5"
+    )
+    return api_key, base_url, model
+
+
+# ── Pipeline YAML helpers ─────────────────────────────────────
+
+def _load_pipeline_yaml(pipeline_id: str) -> dict:
+    path = PIPELINE_DEFS_DIR / f"{pipeline_id}.yaml"
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _get_stage_def(pipeline_yaml: dict, stage: str) -> dict:
+    for s in pipeline_yaml.get("stages", []):
+        if s.get("name") == stage:
+            return s
+    return {}
 
 
 def get_pipeline_name(pipeline_id: str) -> str:
-    """Read the pipeline name from the yaml manifest if possible."""
-    yaml_path = PIPELINE_DEFS_DIR / f"{pipeline_id}.yaml"
-    if not yaml_path.exists():
-        return pipeline_id
+    return _load_pipeline_yaml(pipeline_id).get("name", pipeline_id)
+
+
+# ── Checkpoint helpers ────────────────────────────────────────
+
+def _cp_path(project_id: str, stage: str) -> Path:
+    d = PIPELINES_DIR / project_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"checkpoint_{stage}.json"
+
+
+def _read_checkpoints(project_id: str) -> list[dict]:
+    cp_dir = PIPELINES_DIR / project_id
+    if not cp_dir.exists():
+        return []
+    result = []
+    for f in sorted(cp_dir.glob("checkpoint_*.json")):
+        try:
+            result.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return result
+
+
+def _write_checkpoint(project_id: str, pipeline_id: str, stage: str,
+                       status: str, artifacts: dict,
+                       human_approval_required: bool = False,
+                       error: str | None = None) -> None:
+    cp = {
+        "version": "1.0",
+        "project_id": project_id,
+        "pipeline_type": pipeline_id,
+        "stage": stage,
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checkpoint_policy": "guided",
+        "human_approval_required": human_approval_required,
+        "human_approved": False,
+        "artifacts": artifacts,
+    }
+    if error:
+        cp["error"] = error
+    _cp_path(project_id, stage).write_text(
+        json.dumps(cp, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _load_prior_artifacts(project_id: str) -> dict:
+    """Collect all artifacts from completed checkpoints."""
+    merged: dict[str, Any] = {}
+    for cp in _read_checkpoints(project_id):
+        if cp.get("status") in ("completed", "awaiting_human"):
+            merged.update(cp.get("artifacts", {}))
+    return merged
+
+
+# ── Log helper ────────────────────────────────────────────────
+
+def _log(log_path: Path, msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    logger.info(line)
     try:
-        import yaml
-        with open(yaml_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-            return data.get("name", pipeline_id)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
     except Exception:
-        return pipeline_id
+        pass
 
 
-def _build_headless_prompt(
+# ── LLM call ─────────────────────────────────────────────────
+
+def _call_llm(
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    log_path: Path,
+    timeout: int = 180,
+) -> str:
+    """Single blocking HTTP POST to OpenAI-compatible chat completions endpoint.
+    Returns the raw response content string."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }
+
+    _log(log_path, f"→ POST {url}  model={model}")
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"LLM API error {resp.status_code}: {resp.text[:500]}"
+        )
+
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {})
+    _log(log_path, f"← {resp.status_code}  tokens={usage.get('total_tokens','?')}")
+    return content
+
+
+# ── JSON extraction ───────────────────────────────────────────
+
+def _extract_json(text: str) -> dict:
+    """Extract the first JSON object from LLM response (handles markdown fences)."""
+    # Strip markdown code fences
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+    text = text.strip()
+
+    # Find first { ... } block
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in LLM response")
+
+    # Walk to find matching closing brace
+    depth = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : i + 1])
+
+    raise ValueError("Unbalanced JSON braces in LLM response")
+
+
+# ── System prompt builder ─────────────────────────────────────
+
+def _build_system_prompt(
+    pipeline_id: str,
+    stage: str,
+    stage_def: dict,
+    artifact_contract: dict,
+    human_approval_required: bool,
+) -> str:
+    contract_str = json.dumps(artifact_contract, ensure_ascii=False, indent=2)
+    produces = stage_def.get("produces", list(artifact_contract.keys()))
+    review_focus = "\n".join(f"  - {r}" for r in stage_def.get("review_focus", []))
+    success_criteria = "\n".join(f"  - {s}" for s in stage_def.get("success_criteria", []))
+
+    approval_note = (
+        "This stage requires human approval. You are producing content for review."
+        if human_approval_required
+        else "This stage is auto-approved. Produce complete, final content."
+    )
+
+    return f"""You are the OpenMontage pipeline engine executing stage "{stage}" of the "{pipeline_id}" pipeline.
+
+## Your Role
+You are a deterministic content generator. You receive a product brief and prior stage artifacts,
+and you produce exactly ONE JSON object as output. No explanations, no questions, no markdown prose —
+ONLY the JSON object.
+
+## Stage: {stage}
+Produces: {', '.join(produces)}
+{approval_note}
+
+## Review Focus
+{review_focus or '  - Produce high-quality, complete output'}
+
+## Success Criteria
+{success_criteria or '  - Valid JSON matching the contract below'}
+
+## OUTPUT CONTRACT
+You MUST return a single valid JSON object with this exact structure:
+{contract_str}
+
+## Rules
+1. Return ONLY a JSON object. No text before or after.
+2. All string fields must be in Simplified Chinese unless they are technical identifiers.
+3. Never use placeholder text like "string" — fill in real content based on the brief.
+4. If a field is marked "string or null", use null if not applicable.
+5. Do not add extra fields not in the contract.
+"""
+
+
+# ── Stage executor (runs in background thread) ───────────────
+
+def _execute_stage(
     project_id: str,
     pipeline_id: str,
-    p_name: str,
+    stage: str,
     brief_text: str,
-    stage: str | None,
-) -> str:
-    """Build the structured headless prompt for the background agent."""
-    rel_project_dir = f"projects/{project_id}"
-    rel_brief_path = f"projects/{project_id}/brief.md"
+    lora_model_path: str | None = None,
+    controlnet_weight: float | None = None,
+    transparent_png_path: str | None = None,
+) -> None:
+    """Run a single pipeline stage via direct LLM API call. Designed to run in a thread."""
+    log_path = PROJECTS_DIR / project_id / "agent.log"
+    _log(log_path, f"=== Stage '{stage}' starting ===")
 
-    # ── HEADLESS SYSTEM BLOCK ──────────────────────────────────────────────
-    headless_block = f"""# HEADLESS BATCH EXECUTION MODE
+    try:
+        api_key, base_url, model = _get_llm_config()
+        if not api_key:
+            raise ValueError(
+                "No LLM API key found. Set LLM_API_KEY or ANTHROPIC_API_KEY in .env"
+            )
 
-## Role
-You are the OpenMontage pipeline engine executing a single automated task.
-This process was spawned by the web UI backend via `claude -p` (non-interactive).
-stdin is CLOSED. There is NO human on the other end.
+        # Load pipeline definition
+        pipeline_yaml = _load_pipeline_yaml(pipeline_id)
+        stage_def = _get_stage_def(pipeline_yaml, stage)
+        human_approval_required = stage_def.get("human_approval_default", False)
 
-## Absolute Constraints — read these before doing anything else
-1. DO NOT ask questions. DO NOT request clarification. DO NOT present options.
-2. DO NOT run `skills/meta/onboarding.md` or any onboarding/discovery flow.
-3. DO NOT run preflight capability discovery (`provider_menu_summary`). Skip it.
-4. DO NOT present a capability menu to the user. There is no user session.
-5. When a pipeline stage has `human_approval_default: true`, write the checkpoint
-   with `"status": "awaiting_human"` and EXIT. The web UI handles approval gates.
-6. If a tool or provider is unavailable, pick the best available fallback and proceed.
-   Log your substitution. Never stop to ask which fallback to use.
-7. Write ALL artifacts and assets to: {rel_project_dir}/
-8. Write ALL checkpoints to: pipelines/{project_id}/checkpoint_<stage>.json
+        # Get artifact contract for this stage
+        artifact_contract = STAGE_ARTIFACT_CONTRACTS.get(stage, {
+            "output": {"summary": "string — stage output"}
+        })
 
-## Project Context
-- Pipeline ID  : {pipeline_id}
-- Pipeline Name: {p_name}
-- Project dir  : {rel_project_dir}
-- Brief file   : {rel_brief_path}
+        # Build system prompt
+        system_prompt = _build_system_prompt(
+            pipeline_id, stage, stage_def, artifact_contract, human_approval_required
+        )
 
-## Video Brief (verbatim — use this as the production brief)
----
-{brief_text}
----
-"""
+        # Build user message: brief + prior artifacts + identity preservation
+        prior_artifacts = _load_prior_artifacts(project_id)
+        user_parts = [f"## Product Brief\n{brief_text}"]
 
-    # ── STAGE-SPECIFIC TASK BLOCK ──────────────────────────────────────────
-    if stage:
-        task_block = f"""## Your Task: Execute stage `{stage}` ONLY
+        if prior_artifacts:
+            user_parts.append(
+                "## Prior Stage Artifacts\n"
+                + json.dumps(prior_artifacts, ensure_ascii=False, indent=2)
+            )
 
-Follow these steps in order:
-1. Read `pipeline_defs/{pipeline_id}.yaml` — locate the `{stage}` stage entry.
-2. Read that stage's director skill (`skills/pipelines/{pipeline_id}/{stage}-director.md`).
-   If the file does not exist at that path, search `skills/pipelines/` for a matching file.
-3. Read any Layer 3 skills listed in the `agent_skills` field of any tools you will call.
-4. Execute all work required for the `{stage}` stage. Produce the canonical artifact.
-5. Write the artifact JSON to: {rel_project_dir}/artifacts/
-6. Write the checkpoint JSON to: pipelines/{project_id}/checkpoint_{stage}.json
-   - CRITICAL: The `artifacts` object inside the checkpoint MUST contain the FULL JSON payload of the artifact you produced, NOT just the string file path!
-   - If `human_approval_default: true` for this stage -> set `"status": "awaiting_human"`
-   - Otherwise -> set `"status": "completed"`
-7. STOP HERE. Do not continue to the next stage. Exit after writing the checkpoint.
+        # Identity preservation annotations
+        if lora_model_path:
+            user_parts.append(f"## Identity Preservation\nLoRA model path: {lora_model_path}")
+        if controlnet_weight is not None:
+            user_parts.append(f"ControlNet weight: {controlnet_weight}")
+        if transparent_png_path:
+            user_parts.append(f"Product transparent PNG: {transparent_png_path}")
 
-Begin now. Read the YAML, read the skill, do the work, write the checkpoint, exit.
-"""
-    else:
-        task_block = f"""## Your Task: Run the `{pipeline_id}` pipeline from the first stage
+        user_parts.append(
+            f"\nProduce the '{stage}' stage output now. "
+            "Return ONLY a valid JSON object matching the contract."
+        )
+        user_message = "\n\n".join(user_parts)
 
-Follow these steps:
-1. Read `{rel_brief_path}` — confirm the brief content matches what is above.
-2. Read `pipeline_defs/{pipeline_id}.yaml` — understand the ordered stage sequence.
-3. Execute stages sequentially:
-   a. For each stage: read its director skill, read any required Layer 3 skills.
-   b. Do the work. Produce the canonical artifact.
-   c. Write the artifact to `{rel_project_dir}/artifacts/`
-   d. Write the checkpoint to `pipelines/{project_id}/checkpoint_<stage>.json`
-      - CRITICAL: The `artifacts` object inside the checkpoint MUST contain the FULL JSON payload of the artifact you produced, NOT just the string file path!
-   e. If `human_approval_default: true` -> set `"status": "awaiting_human"` and STOP.
-   f. If `human_approval_default: false` -> set `"status": "completed"` and continue.
-4. Stop when you hit an `awaiting_human` gate or all stages are complete.
+        _log(log_path, f"Calling LLM: base_url={base_url} model={model}")
 
-Begin now. Read the pipeline YAML and execute the first stage.
-"""
+        raw_response = _call_llm(
+            api_key, base_url, model,
+            system_prompt, user_message, log_path
+        )
 
-    return headless_block + task_block
+        _log(log_path, "Parsing JSON response...")
+        artifacts = _extract_json(raw_response)
+        _log(log_path, f"JSON parsed OK — keys: {list(artifacts.keys())}")
 
+        # Write artifact file
+        artifact_dir = PROJECTS_DIR / project_id / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / f"{stage}.json").write_text(
+            json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # Determine final status
+        final_status = "awaiting_human" if human_approval_required else "completed"
+
+        _write_checkpoint(
+            project_id, pipeline_id, stage,
+            status=final_status,
+            artifacts=artifacts,
+            human_approval_required=human_approval_required,
+        )
+
+        _log(log_path, f"=== Stage '{stage}' → {final_status} ===")
+
+    except Exception as exc:
+        _log(log_path, f"[ERROR] Stage '{stage}' failed: {exc}")
+        logger.exception(f"Stage '{stage}' failed for project '{project_id}'")
+        _write_checkpoint(
+            project_id, pipeline_id, stage,
+            status="failed",
+            artifacts={},
+            error=str(exc),
+        )
+
+
+# ── Public API ────────────────────────────────────────────────
 
 def start_agent_for_project(
     project_id: str,
     pipeline_id: str,
     brief_text: str,
-    stage: str = None,
+    stage: str | None = None,
+    lora_model_path: str | None = None,
+    controlnet_weight: float | None = None,
+    transparent_png_path: str | None = None,
 ) -> bool:
     """
-    Launch Claude Code in the background for a specific project stage.
+    Launch a pipeline stage in a background thread.
 
-    Args:
-        project_id: The unique project directory name
-        pipeline_id: The pipeline type (e.g., animated-explainer)
-        brief_text: The user's input brief (verbatim text, not a file path)
-        stage: If provided, the agent executes ONLY this stage and exits.
+    No subprocess, no CLI — uses direct HTTP requests to the OpenAI-compatible
+    LLM API configured in .env (LLM_API_KEY + LLM_BASE_URL).
 
-    Returns:
-        bool: True if the subprocess was successfully spawned, False otherwise.
+    Returns True immediately after spawning the thread.
+    The frontend polls /api/project/{id}/status and /log for progress.
     """
     project_dir = PROJECTS_DIR / project_id
+    if not project_dir.exists():
+        logger.error(f"Project directory not found: {project_dir}")
+        return False
+
+    if stage is None:
+        # Auto-detect next stage from pipeline YAML
+        from lib.checkpoint import get_next_stage
+        stage = get_next_stage(PIPELINE_DEFS_DIR, project_id, pipeline_id)
+        if not stage:
+            logger.info(f"All stages complete for {project_id}")
+            return False
+
     log_path = project_dir / "agent.log"
+    _log(log_path, f"--- Starting stage '{stage}' for {project_id} ---")
 
-    p_name = get_pipeline_name(pipeline_id)
-    prompt_text = _build_headless_prompt(project_id, pipeline_id, p_name, brief_text, stage)
-
-    # Write the prompt to a temp file in the project directory.
-    # This avoids Windows command-line length limits and shell argument mangling
-    # that can truncate or corrupt multi-line prompts passed as CLI arguments.
-    prompt_file_path = project_dir / "agent_prompt.txt"
-    try:
-        with open(prompt_file_path, "w", encoding="utf-8") as pf:
-            pf.write(prompt_text)
-    except Exception as e:
-        logger.error(f"Failed to write prompt file for {project_id}: {e}")
-        return False
-
-    cwd = project_dir.parent.parent  # Workspace root (OpenMontage repo root)
-    is_windows = platform.system() == "Windows"
-
-    # Build the subprocess environment: inherit current env + load .env file.
-    # This ensures ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, etc. are available
-    # to the claude subprocess even when uvicorn was started without them.
-    import os as _os
-    child_env = _os.environ.copy()
-    dotenv_path = cwd / ".env"
-    if dotenv_path.exists():
-        try:
-            for line in dotenv_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                k = k.strip()
-                v = v.split("#")[0].strip()  # strip inline comments
-                if k and v:
-                    child_env.setdefault(k, v)  # don't overwrite already-set vars
-        except Exception as _e:
-            logger.warning(f"Could not load .env for subprocess: {_e}")
-
-    try:
-        log_file = open(log_path, "a", encoding="utf-8")
-        prompt_fd = open(prompt_file_path, "r", encoding="utf-8")
-        
-        stage_msg = f"stage '{stage}'" if stage else "full pipeline"
-        log_file.write(f"--- Starting Background Agent for {project_id} ({stage_msg}) ---\n")
-        log_file.flush()
-
-        # Build command: use executable alias on Windows
-        executable = "claude.cmd" if is_windows else "claude"
-        cmd_list = [executable, "-p", "--permission-mode", "bypassPermissions"]
-
-        # Run as a detached process on Windows so it doesn't receive Ctrl+C from the UI console,
-        # which causes cmd.exe to prompt "Terminate batch job (Y/N)?" and read from our stdin (the prompt).
-        kwargs = {}
-        if is_windows:
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
-
-        p = subprocess.Popen(
-            cmd_list,
-            cwd=str(cwd),
-            stdin=prompt_fd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            shell=False,
-            text=True,
-            env=child_env,
-            **kwargs
-        )
-
-        # Quick-check: give the process 2 seconds to either produce output or crash.
-        # If it exits immediately with a non-zero code, log the failure clearly.
-        def _monitor(proc, log_fd, prompt_fd, pid, stg):
-            import time
-            time.sleep(2)
-            rc = proc.poll()
-            if rc is not None and rc != 0:
-                try:
-                    log_fd.write(
-                        f"\n[ERROR] Agent process exited immediately with code {rc}.\n"
-                        f"  Possible causes:\n"
-                        f"  1. 'claude' CLI is not installed or not on PATH.\n"
-                        f"     Install: npm install -g @anthropic-ai/claude-code\n"
-                        f"  2. API key (ANTHROPIC_API_KEY) is missing or invalid.\n"
-                        f"     Check: .env file at project root.\n"
-                        f"  3. claude.cmd not found on Windows PATH.\n"
-                        f"     Try running 'claude --version' in a terminal.\n"
-                    )
-                    log_fd.flush()
-                except Exception:
-                    pass
-                # Write a failed checkpoint so the UI shows the error state
-                try:
-                    import json as _json
-                    cp_dir = Path(__file__).resolve().parent.parent / "pipelines" / pid
-                    cp_dir.mkdir(parents=True, exist_ok=True)
-                    cp_path = cp_dir / f"checkpoint_{stg or 'unknown'}.json"
-                    # Only overwrite if currently in_progress
-                    if cp_path.exists():
-                        existing = _json.loads(cp_path.read_text(encoding="utf-8"))
-                        if existing.get("status") == "in_progress":
-                            existing["status"] = "failed"
-                            existing["error"] = f"Agent process exited with code {rc}. Check agent.log for details."
-                            cp_path.write_text(_json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
-            # Always close handles when process ends
-            try:
-                proc.wait()
-                log_fd.close()
-                prompt_fd.close()
-            except Exception:
-                pass
-
-        threading.Thread(
-            target=_monitor,
-            args=(p, log_file, prompt_fd, project_id, stage),
-            daemon=True
-        ).start()
-
-        logger.info(f"Background agent started for {project_id} (stage={stage})")
-        return True
-    except FileNotFoundError:
-        # claude.cmd / claude not found on PATH
-        msg = (
-            f"'claude' CLI not found on PATH. "
-            f"Install it with: npm install -g @anthropic-ai/claude-code"
-        )
-        logger.error(msg)
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n[ERROR] {msg}\n")
-        except Exception:
-            pass
-        return False
-    except Exception as e:
-        logger.error(f"Failed to spawn background agent for {project_id}: {e}")
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n[ERROR] Failed to start agent subprocess: {e}\n")
-        except Exception:
-            pass
-        return False
+    thread = threading.Thread(
+        target=_execute_stage,
+        args=(project_id, pipeline_id, stage, brief_text,
+              lora_model_path, controlnet_weight, transparent_png_path),
+        daemon=True,
+        name=f"stage-{project_id}-{stage}",
+    )
+    thread.start()
+    logger.info(f"Thread started: stage={stage} project={project_id}")
+    return True
