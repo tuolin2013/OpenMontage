@@ -48,6 +48,13 @@ export const abortProject = (id, reason) =>
 export const getAgentLog = (id, tail = 300) =>
   http.get(`/project/${id}/log`, { params: { tail } })
 
+// ── Products ──────────────────────────────────────────────────
+
+export const listProducts = () => http.get('/products')
+
+export const getProduct = (name) =>
+  http.get(`/products/${encodeURIComponent(name)}`)
+
 // ── Health ────────────────────────────────────────────────────
 
 export const getHealth = () => http.get('/health')

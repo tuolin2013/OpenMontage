@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from web_api.routers import projects, stages, checkpoints
+from web_api.routers import projects, stages, checkpoints, products
 
 app = FastAPI(
     title="OpenMontage Web API",
@@ -40,6 +40,7 @@ app.add_middleware(
 app.include_router(projects.router, prefix="/api/project", tags=["projects"])
 app.include_router(stages.router, prefix="/api/project", tags=["stages"])
 app.include_router(checkpoints.router, prefix="/api/project", tags=["checkpoints"])
+app.include_router(products.router, prefix="/api", tags=["products"])
 
 
 @app.get("/api/health", tags=["system"])
