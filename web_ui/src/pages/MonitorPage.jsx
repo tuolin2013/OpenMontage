@@ -10,7 +10,7 @@
 import React, { useState, useCallback } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getProjectStatus, runStage, abortProject, getAgentLog } from '../api'
+import { getProjectStatus, runStage, abortProject, getAgentLog, executeAssets } from '../api'
 import StagePipeline from '../components/StagePipeline'
 import ArtifactEditor from '../components/ArtifactEditor'
 
@@ -246,11 +246,119 @@ function ProjectMonitor({ projectId }) {
         </div>
       )}
 
+      {/* ── Asset generation gate (assets stage completed, files not yet generated) ── */}
+      <AssetExecutionPanel
+        projectId={projectId}
+        cpMap={cpMap}
+        onRefresh={refresh}
+        onError={setActionError}
+      />
+
       {/* ── All artifacts viewer (read-only tabs) ───────────── */}
       <ArtifactViewer checkpoints={checkpoints} projectId={projectId} onRefresh={refresh} />
 
       {/* ── Agent log ───────────────────────────────────────── */}
       <AgentLogPanel projectId={projectId} projectStatus={project?.status} />
+    </div>
+  )
+}
+
+// ── Asset execution panel ─────────────────────────────────────
+// Shown when the 'assets' stage is completed but actual files haven't been generated yet.
+// The LLM only produces a manifest with placeholder file_path values —
+// this panel calls POST /execute_assets to actually run image/video/TTS/music generation.
+function AssetExecutionPanel({ projectId, cpMap, onRefresh, onError }) {
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState(null)
+
+  const assetsCp = cpMap['assets']
+  // Show only when assets planning stage is done (completed/awaiting_human) and no edit stage yet
+  const assetsReady = assetsCp && ['completed', 'awaiting_human'].includes(assetsCp.status)
+  const editDone = cpMap['edit'] && ['completed', 'in_progress', 'awaiting_human'].includes(cpMap['edit'].status)
+
+  // Also show if assets were executed but partially failed (re-run option)
+  if (!assetsReady) return null
+
+  async function handleExecute() {
+    setRunning(true)
+    setResult(null)
+    onError(null)
+    try {
+      const res = await executeAssets(projectId)
+      setResult(res)
+      onRefresh()
+    } catch (err) {
+      onError(err.message)
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  // Check if files already exist by looking at result or existing data
+  const hasResult = result !== null
+
+  return (
+    <div className="card border-blue-700/50 bg-blue-900/10 space-y-4">
+      <div className="flex items-start gap-4">
+        <div className="text-3xl">⚙️</div>
+        <div className="flex-1">
+          <div className="text-blue-400 font-bold text-lg">素材生成</div>
+          <div className="text-sm text-gray-400 mt-1">
+            AI 已规划好素材清单（{Object.keys(assetsCp.artifacts ?? {}).length} 个 artifact）。
+            点击下方按钮调用图像/视频/配音/背景音乐 API，实际生成所有媒体文件。
+          </div>
+          <div className="mt-1 text-xs text-gray-500">
+            图像: right.codes gpt-image-2 &nbsp;·&nbsp;
+            视频: Kling v3 &nbsp;·&nbsp;
+            配音: VoxCPM2 / ElevenLabs &nbsp;·&nbsp;
+            音乐: Suno V4
+          </div>
+        </div>
+      </div>
+
+      {!hasResult ? (
+        <div className="flex items-center gap-3">
+          <button
+            className="btn btn-primary"
+            disabled={running}
+            onClick={handleExecute}
+          >
+            {running
+              ? <><span className="stage-spinner inline-block w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full mr-2" />生成中… (可能需要 3–10 分钟)</>
+              : '🎨 执行素材生成'}
+          </button>
+          {editDone && (
+            <span className="text-xs text-gray-500">
+              ⚠️ edit 阶段已存在，重新生成会覆盖素材文件
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className={`flex items-center gap-2 text-sm font-semibold ${result.failed > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
+            {result.failed > 0 ? '⚠️' : '✅'}
+            共 {result.tasks_total} 项 — 成功 {result.succeeded}，失败 {result.failed}
+          </div>
+
+          <div className="grid gap-1 max-h-48 overflow-y-auto">
+            {(result.results ?? []).map((r, i) => (
+              <div key={i} className={`flex items-center justify-between text-xs px-3 py-1.5 rounded ${r.status === 'ok' ? 'bg-emerald-900/30 text-emerald-300' : 'bg-red-900/30 text-red-400'}`}>
+                <span>{r.status === 'ok' ? '✓' : '✗'} {r.task}</span>
+                {r.status === 'ok'
+                  ? <span className="text-gray-500 truncate max-w-[200px]">{r.path?.split('/').pop()}</span>
+                  : <span className="text-red-500 truncate max-w-[200px]">{r.error}</span>
+                }
+              </div>
+            ))}
+          </div>
+
+          {result.failed > 0 && (
+            <button className="btn btn-ghost btn-sm" onClick={handleExecute} disabled={running}>
+              🔁 重试失败项
+            </button>
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -55,6 +55,12 @@ export const listProducts = () => http.get('/products')
 export const getProduct = (name) =>
   http.get(`/products/${encodeURIComponent(name)}`)
 
+// ── Asset execution ───────────────────────────────────────────
+
+/** Trigger actual image/video/TTS/music generation from assets.json manifest */
+export const executeAssets = (id) =>
+  http.post(`/project/${id}/execute_assets`, {}, { timeout: 600_000 }) // 10 min max
+
 // ── Health ────────────────────────────────────────────────────
 
 export const getHealth = () => http.get('/health')
