@@ -403,16 +403,35 @@ def _generate_video_clip(prompt: str, image_path: str | None, out_path: Path) ->
 
 
 def _generate_music(style_prompt: str, out_path: Path) -> dict:
-    """Try ElevenLabs music → Pixabay fallback."""
+    """Try Suno → ElevenLabs → Pixabay fallback."""
     import os
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── 1. Suno (best quality, any genre, instrumental) ───────────────────
+    if os.environ.get("SUNO_API_KEY"):
+        try:
+            from tools.audio.suno_music import SunoMusic
+            suno = SunoMusic()
+            r = suno.execute({
+                "prompt": style_prompt[:500],
+                "instrumental": True,
+                "model": "V4",
+                "output_path": str(out_path),
+            })
+            if r.success:
+                log.info("  Suno music: %s", r.data.get("title", "untitled"))
+                return {"success": True, "path": str(out_path)}
+            log.warning("Suno music failed (%s), trying ElevenLabs…", r.error)
+        except Exception as exc:
+            log.warning("Suno music exception (%s), trying ElevenLabs…", exc)
+
+    # ── 2. ElevenLabs ────────────────────────────────────────────────────
     if os.environ.get("ELEVENLABS_API_KEY"):
         try:
             from tools.audio.music_gen import MusicGen
             mg = MusicGen()
             r = mg.execute({
-                "prompt": style_prompt[:200],  # keep prompt concise
+                "prompt": style_prompt[:200],
                 "duration": 30,
                 "duration_seconds": 30,
                 "output_path": str(out_path),
@@ -423,7 +442,7 @@ def _generate_music(style_prompt: str, out_path: Path) -> dict:
         except Exception as exc:
             log.warning("MusicGen exception (%s), trying Pixabay…", exc)
 
-    # Pixabay free stock music as fallback
+    # ── 3. Pixabay free stock music ───────────────────────────────────────
     if os.environ.get("PIXABAY_API_KEY"):
         try:
             from tools.audio.pixabay_music import PixabayMusic

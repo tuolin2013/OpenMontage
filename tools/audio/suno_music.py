@@ -211,7 +211,9 @@ class SunoMusic(BaseTool):
             "model": model,
             "customMode": custom_mode,
             "instrumental": instrumental,
-            "callBackUrl": "",  # no webhook; we poll
+            # sunoapi.org requires a non-empty callBackUrl; use a dummy sink
+            # since we poll via record-info instead of waiting for the webhook
+            "callBackUrl": "https://httpbin.org/post",
         }
 
         if custom_mode:
@@ -260,7 +262,23 @@ class SunoMusic(BaseTool):
             status = result.get("data", {}).get("status") or result.get("status", "")
 
             if status == "SUCCESS":
-                return result.get("data", result)
+                # sunoapi.org wraps result in data.response.sunoData
+                outer = result.get("data", result)
+                suno_data = outer.get("response", {}).get("sunoData")
+                if suno_data:
+                    # Normalise to {data: [{audio_url, title, id, ...}]}
+                    normalised = []
+                    for item in suno_data:
+                        normalised.append({
+                            "audio_url": item.get("audioUrl") or item.get("sourceAudioUrl"),
+                            "id": item.get("id"),
+                            "title": item.get("title"),
+                            "duration": item.get("duration"),
+                            "image_url": item.get("imageUrl"),
+                            "tags": item.get("tags"),
+                        })
+                    return {"data": normalised}
+                return outer
             elif status in (
                 "CREATE_TASK_FAILED",
                 "GENERATE_AUDIO_FAILED",
