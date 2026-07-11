@@ -41,9 +41,12 @@
 
 ---
 
-## 3. Claude AWS（AWS Bedrock 路由）
+## 3. Claude AWS（AWS Bedrock 路由）⚡ 计费倍率 0.3x，最划算
 
 **Base URL：** `https://www.right.codes/claude-aws/v1`
+
+> ⚠️ 备注：awsq 逆向，有 opus，支持 1M 上下文，缓存率对标 Max 渠道，此渠道暂时活了，且用且珍惜
+> 计费倍率 **0.3x**，即同等 claude-sonnet-5 实际只需 $0.6/M 输入（官方 $3 × 0.3 = $0.6）
 
 | 模型 ID | 说明 |
 |---------|------|
@@ -124,35 +127,50 @@
 
 ## 如何选择模型：效果 vs 价格
 
-### 定价概览（来自 right.codes 网站，per 1M tokens）
+### 定价概览（实际价格来自 right.codes 控制台，per 1M tokens）
 
-| 模型 | 端点 | 输入价 | 输出价 | 综合评分 |
-|------|------|--------|--------|----------|
-| `claude-sonnet-5` | claude-sale | 约 $3 | 约 $15 | ⭐⭐⭐⭐⭐ 最强推理 |
-| `claude-opus-4-8` | claude-sale | 约 $15 | 约 $75 | ⭐⭐⭐⭐⭐ 旗舰，但贵 |
-| `claude-haiku-4-5-20251001` | claude-sale | 约 $0.8 | 约 $4 | ⭐⭐⭐⭐ 快且便宜 |
-| `gpt-5.4` | codex | $1 | $6 | ⭐⭐⭐⭐ 性价比高 |
-| `gpt-5.4-mini` | codex | $0.3 | $1.8 | ⭐⭐⭐ 最便宜 |
-| `gpt-5.5` | codex | $2 | $12 | ⭐⭐⭐⭐ 高性能 |
-| `gpt-5.6-luna` | codex | $0.4 | $2.4 | ⭐⭐⭐ 轻量快速 |
-| `gemini-3.5-flash` | gemini | 极低 | 极低 | ⭐⭐⭐⭐ 速度最快 |
-| `gemini-3.1-pro` | gemini | 约 $1.25 | 约 $5 | ⭐⭐⭐⭐ Google 旗舰 |
-| `deepseek-v4-pro` | deepseek | $3 | $6 | ⭐⭐⭐⭐ 中文强 |
-| `deepseek-v4-flash` | deepseek | 极低 | 极低 | ⭐⭐⭐ 快速版 |
-| `qwen3.7-max` | ali | 约 $0.5 | 约 $2 | ⭐⭐⭐⭐ 中文最优 |
-| `qwen3.6-flash` | ali | 极低 | 极低 | ⭐⭐⭐ 极速 |
-| `kimi-k2.7-code` | ali | 约 $1 | 约 $3 | ⭐⭐⭐⭐ 代码专用 |
+| 模型 | 端点 | 输入价 | 输出价 | 缓存读 | 综合评分 |
+|------|------|--------|--------|--------|----------|
+| `claude-sonnet-5` | **claude-aws** (0.3x) | **$0.9** | **$4.5** | $0.09 | 🏆 效果最强×性价比最高 |
+| `claude-sonnet-5` | claude-sale | $3 | $15 | $0.3 | ⭐⭐⭐⭐⭐ 最强推理（直连） |
+| `claude-opus-4-8` | claude-aws (0.3x) | **$4.5** | **$22.5** | $0.45 | ⭐⭐⭐⭐⭐ 旗舰低价版 |
+| `claude-opus-4-8` | claude-sale | $15 | $75 | $1.5 | ⭐⭐⭐⭐ 旗舰，原价 |
+| `claude-haiku-4-5-20251001` | claude-aws (0.3x) | **$0.3** | **$1.5** | $0.03 | ⭐⭐⭐⭐⭐ 极速极廉 |
+| `claude-haiku-4-5-20251001` | claude-sale | $1 | $5 | $0.1 | ⭐⭐⭐⭐ 快且便宜 |
+| `gpt-5.4` | codex | $1 | $6 | — | ⭐⭐⭐⭐ 性价比高 |
+| `gpt-5.4-mini` | codex | $0.3 | $1.8 | — | ⭐⭐⭐ 最便宜 |
+| `gpt-5.5` | codex | $2 | $12 | — | ⭐⭐⭐⭐ 高性能 |
+| `gpt-5.6-luna` | codex | $0.4 | $2.4 | — | ⭐⭐⭐ 轻量快速 |
+| `gemini-2.5-flash` | gemini | $0.1 | $3.5 | $0 | ⭐⭐⭐⭐⭐ 最便宜 Flash |
+| `gemini-3.5-flash` | gemini | $0.1 | $3.5 | $0 | ⭐⭐⭐⭐⭐ 最新 Flash |
+| `gemini-2.5-pro` | gemini | $1.25 | $7 | $0 | ⭐⭐⭐⭐ Google 旗舰 |
+| `gemini-3.1-pro` | gemini | $1 | $7 | $0 | ⭐⭐⭐⭐ 稳定版 |
+| `deepseek-v4-pro` | deepseek | $3 | $6 | — | ⭐⭐⭐⭐ 中文推理强 |
+| `deepseek-v4-flash` | deepseek | $0.1 | $0.3 | — | ⭐⭐⭐ 极速极廉 |
+| `qwen3.7-max` | ali | $0.5 | $2 | — | ⭐⭐⭐⭐ 中文最优 |
+| `qwen3.6-flash` | ali | $0.05 | $0.2 | — | ⭐⭐⭐ 极速 |
+| `kimi-k2.7-code` | ali | $1 | $3 | — | ⭐⭐⭐⭐ 代码专用 |
 
 ---
 
 ### 按场景推荐
 
-#### 🏆 效果优先（不计成本）
+#### 🏆 效果最强 × 性价比最高（当前隐藏最优解）
+```
+LLM_BASE_URL=https://www.right.codes/claude-aws/v1
+LLM_MODEL=claude-sonnet-5
+```
+> claude-aws 端点计费 0.3x 倍率，claude-sonnet-5 实际只需 $0.9/$4.5 per M tokens，比直连便宜 3.3 倍，效果完全相同。  
+> ⚠️ 注意：此为逆向渠道，不稳定，建议备用 claude-sale 作为降级。
+
+---
+
+#### 🏆 效果优先（稳定直连）
 ```
 LLM_BASE_URL=https://www.right.codes/claude-sale/v1
 LLM_MODEL=claude-sonnet-5
 ```
-> Claude Sonnet 5 是当前推理能力最强的模型，适合 research、proposal、script 等创意阶段。
+> Claude Sonnet 5 直连 Anthropic，稳定性最高，适合生产环境。
 
 ---
 
