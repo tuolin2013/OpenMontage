@@ -168,7 +168,27 @@ def start_agent_for_project(
 
     cwd = project_dir.parent.parent  # Workspace root (OpenMontage repo root)
     is_windows = platform.system() == "Windows"
-    
+
+    # Build the subprocess environment: inherit current env + load .env file.
+    # This ensures ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, etc. are available
+    # to the claude subprocess even when uvicorn was started without them.
+    import os as _os
+    child_env = _os.environ.copy()
+    dotenv_path = cwd / ".env"
+    if dotenv_path.exists():
+        try:
+            for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.split("#")[0].strip()  # strip inline comments
+                if k and v:
+                    child_env.setdefault(k, v)  # don't overwrite already-set vars
+        except Exception as _e:
+            logger.warning(f"Could not load .env for subprocess: {_e}")
+
     try:
         log_file = open(log_path, "a", encoding="utf-8")
         prompt_fd = open(prompt_file_path, "r", encoding="utf-8")
@@ -195,6 +215,7 @@ def start_agent_for_project(
             stderr=subprocess.STDOUT,
             shell=False,
             text=True,
+            env=child_env,
             **kwargs
         )
 
