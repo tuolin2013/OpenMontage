@@ -105,7 +105,59 @@ Works with **Claude Code, Cursor, Copilot, Windsurf, Codex** — any AI coding a
 
 ---
 
-## Quick Start
+## Web SaaS UI (v2)
+
+OpenMontage ships with a full-stack Web UI that lets you run pipelines from a browser — no AI coding assistant needed for daily operation.
+
+```
+web_api/    FastAPI backend  — port 8000
+web_ui/     React + Vite + Tailwind frontend  — port 5173
+```
+
+### Start the Web UI
+
+```bash
+# 1. Install Python backend deps
+pip install -r web_api/requirements.txt
+
+# 2. Install frontend deps (first time only)
+cd web_ui && npm install && cd ..
+
+# 3. Launch both services (Windows)
+start_web.bat
+
+# Or manually:
+uvicorn web_api.main:app --reload --port 8000   # terminal 1
+cd web_ui && npm run dev                         # terminal 2
+```
+
+Open **http://localhost:5173** in your browser.
+
+| URL | Description |
+|-----|-------------|
+| `http://localhost:5173/` | 新建商品视频流水线 — product form with LoRA / ControlNet / PNG upload |
+| `http://localhost:5173/monitor/:id` | 状态机工作台 — live pipeline node graph, approval gates, artifact editor |
+| `http://localhost:8000/api/docs` | FastAPI interactive docs |
+
+### Web API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/project/create` | Create project from JSON body (product name, selling points, LoRA path, etc.) |
+| `POST` | `/api/project/create/upload` | Multipart variant — accepts transparent PNG upload directly |
+| `POST` | `/api/project/{id}/run_stage` | Trigger a specific stage (or auto-detect next) |
+| `GET`  | `/api/project/{id}/status` | Full status + checkpoint summary |
+| `GET`  | `/api/project/{id}/checkpoint?stage=` | Read checkpoint JSON for a stage |
+| `PATCH`| `/api/project/{id}/checkpoint` | Save human-edited artifact data |
+| `POST` | `/api/project/{id}/approve` | Approve awaiting_human gate + optionally start next stage |
+| `POST` | `/api/project/{id}/abort` | Abort running stage |
+| `GET`  | `/api/project/{id}/log` | Tail agent.log |
+
+Identity-preservation fields (`lora_model_path`, `controlnet_weight`, `transparent_png_path`) are stored in `meta.json` at creation time and automatically injected into every subsequent stage prompt — no need to re-submit them.
+
+---
+
+## Quick Start (Agent / CLI mode)
 
 ### Prerequisites
 
