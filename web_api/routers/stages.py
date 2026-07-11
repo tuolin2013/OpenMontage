@@ -143,6 +143,42 @@ async def project_status(project_id: str):
     })
 
 
+@router.post("/{project_id}/execute_assets")
+async def execute_assets(project_id: str):
+    """
+    Execute the actual asset generation tasks defined in artifacts/assets.json.
+
+    This calls FluxImage (images), ElevenLabsTTS/DoubaoTTS (voiceover), and
+    MusicGen/PixabayMusic (background music) — populating file_path fields
+    in the manifest.  Can be called from the Pipeline Monitor after the
+    'assets' planning stage is approved.
+    """
+    project_dir = PROJECTS_DIR / project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    artifact_path = project_dir / "artifacts" / "assets.json"
+    if not artifact_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="assets.json not found — run the 'assets' planning stage first",
+        )
+
+    import asyncio
+    from lib.asset_executor import execute_assets as _execute_assets
+
+    try:
+        # Run in thread pool to avoid blocking the event loop (calls are blocking I/O)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _execute_assets(project_id, project_dir)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Asset execution failed: {exc}")
+
+    return JSONResponse(content=result)
+
+
 # ── Internal helpers ──────────────────────────────────────────
 
 def _read_meta(project_dir: Path) -> dict:
