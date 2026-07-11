@@ -51,9 +51,8 @@ def execute_assets(project_id: str, project_dir: Path) -> dict[str, Any]:
     # ── 1. Images ───────────────────────────────────────────────────────────
     images = manifest.get("images", [])
     if images:
-        log.info("Generating %d images via FLUX…", len(images))
-        from tools.graphics.flux_image import FluxImage
-        flux = FluxImage()
+        log.info("Generating %d images…", len(images))
+        image_tool = _get_image_tool()
         for img in images:
             scene_id = img.get("scene_id", "unknown")
             prompt = img.get("prompt", "")
@@ -68,12 +67,12 @@ def execute_assets(project_id: str, project_dir: Path) -> dict[str, Any]:
                 if isinstance(scene_id, int) else \
                 assets_dir / "images" / f"scene_{scene_id}.png"
 
-            log.info("  Generating scene %s…", scene_id)
-            tool_result = flux.execute({
+            log.info("  Generating scene %s via %s…", scene_id, image_tool.provider)
+            tool_result = image_tool.execute({
                 "prompt": prompt,
                 "width": 1080,
                 "height": 1920,   # 9:16 for short video
-                "model": "flux/dev",
+                "model": "gpt-image-2",
                 "output_path": str(out_path),
             })
 
@@ -135,6 +134,36 @@ def execute_assets(project_id: str, project_dir: Path) -> dict[str, Any]:
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────
+
+def _get_image_tool():
+    """Return the best available image generation tool.
+
+    Priority: RightcodesImage (uses LLM_API_KEY, no extra key) → FluxImage (FAL_KEY)
+    """
+    import os
+    if os.environ.get("LLM_API_KEY") or os.environ.get("RIGHTCODES_API_KEY"):
+        try:
+            from tools.graphics.rightcodes_image import RightcodesImage
+            tool = RightcodesImage()
+            if tool.get_status().name == "AVAILABLE":
+                log.info("Image tool: RightcodesImage (right.codes gpt-image-2)")
+                return tool
+        except Exception as exc:
+            log.warning("RightcodesImage unavailable (%s), falling back to FLUX", exc)
+
+    if os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY"):
+        try:
+            from tools.graphics.flux_image import FluxImage
+            log.info("Image tool: FluxImage (fal.ai FLUX dev)")
+            return FluxImage()
+        except Exception as exc:
+            log.warning("FluxImage unavailable: %s", exc)
+
+    raise RuntimeError(
+        "No image generation tool available. "
+        "Set LLM_API_KEY (right.codes) or FAL_KEY (fal.ai) in .env"
+    )
+
 
 def _generate_tts(text: str, out_path: Path) -> dict:
     """Try VoxCPM2 (Modal) → ElevenLabs → Doubao → fail."""
