@@ -84,7 +84,50 @@ def execute_assets(project_id: str, project_dir: Path) -> dict[str, Any]:
                 log.error("  ❌ scene %s failed: %s", scene_id, tool_result.error)
                 results.append({"task": f"image_scene_{scene_id}", "status": "failed", "error": tool_result.error})
 
-    # ── 2. Voiceover ─────────────────────────────────────────────────────────
+    # ── 2. Videos ────────────────────────────────────────────────────────────
+    # Generate a short video clip for each scene from its image (i2v) or prompt (t2v)
+    videos = manifest.get("videos", [])
+    # If no explicit videos list, derive from images
+    if not videos and images:
+        videos = [
+            {
+                "scene_id": img.get("scene_id"),
+                "prompt": img.get("video_prompt") or img.get("prompt", ""),
+                "image_path": img.get("file_path"),
+                "file_path": img.get("video_path"),
+            }
+            for img in images
+        ]
+
+    if videos:
+        log.info("Generating %d video clips…", len(videos))
+        for clip in videos:
+            scene_id = clip.get("scene_id", "unknown")
+            if clip.get("file_path"):
+                log.info("  video scene %s already exists, skipping", scene_id)
+                continue
+
+            out_vid = assets_dir / "video" / (
+                f"scene_{scene_id:02d}.mp4" if isinstance(scene_id, int) else f"scene_{scene_id}.mp4"
+            )
+            vid_result = _generate_video_clip(
+                prompt=clip.get("prompt", ""),
+                image_path=clip.get("image_path"),
+                out_path=out_vid,
+            )
+            if vid_result["success"]:
+                clip["file_path"] = vid_result["path"]
+                # Also back-fill into the images entry for compose stage
+                for img in images:
+                    if img.get("scene_id") == scene_id:
+                        img["video_path"] = vid_result["path"]
+                log.info("  ✅ video scene %s → %s", scene_id, out_vid.name)
+                results.append({"task": f"video_scene_{scene_id}", "status": "ok", "path": vid_result["path"]})
+            else:
+                log.error("  ❌ video scene %s failed: %s", scene_id, vid_result.get("error"))
+                results.append({"task": f"video_scene_{scene_id}", "status": "failed", "error": vid_result.get("error")})
+
+    # ── 3. Voiceover ─────────────────────────────────────────────────────────
     voiceover = manifest.get("voiceover", {})
     vo_text = voiceover.get("text", "")
     if vo_text and not voiceover.get("file_path"):
@@ -242,6 +285,121 @@ def _wav_to_mp3(wav_path: Path, mp3_path: Path) -> Path:
         pass
     # ffmpeg not available or failed — return wav
     return wav_path
+
+
+def _upload_to_fal(local_path: str) -> str | None:
+    """Upload a local file to fal.ai storage and return the public URL.
+
+    Tries two methods:
+    1. fal-client SDK (handles auth + retries cleanly)
+    2. Direct REST POST to storage.fal.run/upload (fallback)
+    """
+    import os
+    api_key = os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
+    if not api_key:
+        return None
+
+    # Method 1: fal-client SDK
+    try:
+        import fal_client  # pip install fal-client
+        os.environ.setdefault("FAL_KEY", api_key)
+        url = fal_client.upload_file(local_path)
+        log.info("  Uploaded (sdk) %s → %s", Path(local_path).name, url)
+        return url
+    except ImportError:
+        pass
+    except Exception as exc:
+        log.debug("  fal-client SDK upload failed: %s", exc)
+
+    # Method 2: direct REST upload
+    try:
+        import requests
+        filename = Path(local_path).name
+        with open(local_path, "rb") as f:
+            data = f.read()
+        resp = requests.post(
+            "https://storage.fal.run/upload",
+            headers={"Authorization": f"Key {api_key}"},
+            files={"file": (filename, data, "image/png")},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        url = resp.json().get("url")
+        log.info("  Uploaded (rest) %s → %s", filename, url)
+        return url
+    except Exception as exc:
+        log.warning("  fal.ai upload failed: %s", exc)
+        return None
+
+
+def _generate_video_clip(prompt: str, image_path: str | None, out_path: Path) -> dict:
+    """Generate a 5s video clip.
+
+    Strategy:
+    - If image_path exists (generated from scene image): KlingVideo image_to_video
+      → preserves product appearance, ~$0.10/clip
+    - Otherwise: KlingVideo text_to_video
+    - Fallback: SeedanceVideo (more expensive but higher quality)
+    """
+    import os
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not (os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")):
+        return {"success": False, "error": "FAL_KEY not set — video generation unavailable"}
+
+    from tools.video.kling_video import KlingVideo
+    kling = KlingVideo()
+
+    # Decide operation
+    has_image = image_path and Path(image_path).exists()
+    operation = "image_to_video" if has_image else "text_to_video"
+
+    inputs: dict = {
+        "prompt": prompt,
+        "operation": operation,
+        "model_variant": "v3/standard",
+        "duration": "5",
+        "aspect_ratio": "9:16",
+        "output_path": str(out_path),
+    }
+    if has_image:
+        # Kling needs a public URL — upload local file to fal.ai storage first
+        fal_url = _upload_to_fal(image_path)
+        if fal_url:
+            inputs["image_url"] = fal_url
+        else:
+            # Can't upload, fall back to text_to_video
+            log.warning("  fal.ai upload failed, switching to text_to_video")
+            inputs["operation"] = "text_to_video"
+            inputs.pop("image_url", None)
+
+    log.info("  Generating clip (%s) via Kling v3…", operation)
+    r = kling.execute(inputs)
+    if r.success:
+        return {"success": True, "path": str(out_path)}
+
+    log.warning("Kling failed (%s), trying Seedance…", r.error)
+
+    # Seedance fallback
+    from tools.video.seedance_video import SeedanceVideo
+    seedance = SeedanceVideo()
+    s_inputs: dict = {
+        "prompt": prompt,
+        "operation": "image_to_video" if has_image else "text_to_video",
+        "model_variant": "fast",
+        "duration": "5",
+        "aspect_ratio": "9:16",
+        "generate_audio": False,  # we have separate TTS
+        "output_path": str(out_path),
+    }
+    if has_image:
+        s_inputs["image_path"] = image_path
+
+    r2 = seedance.execute(s_inputs)
+    if r2.success:
+        return {"success": True, "path": str(out_path)}
+
+    return {"success": False, "error": f"All video tools failed. Kling: {r.error}. Seedance: {r2.error}"}
 
 
 def _generate_music(style_prompt: str, out_path: Path) -> dict:
