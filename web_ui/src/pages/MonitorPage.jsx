@@ -250,7 +250,7 @@ function ProjectMonitor({ projectId }) {
       <ArtifactViewer checkpoints={checkpoints} projectId={projectId} onRefresh={refresh} />
 
       {/* ── Agent log ───────────────────────────────────────── */}
-      <AgentLogPanel projectId={projectId} />
+      <AgentLogPanel projectId={projectId} projectStatus={project?.status} />
     </div>
   )
 }
@@ -303,28 +303,69 @@ function ArtifactViewer({ checkpoints, projectId, onRefresh }) {
 }
 
 // ── Agent log panel ───────────────────────────────────────────
-function AgentLogPanel({ projectId }) {
+function AgentLogPanel({ projectId, projectStatus }) {
   const { data } = useQuery({
     queryKey: ['log', projectId],
     queryFn: () => getAgentLog(projectId, 300),
     refetchInterval: 4000,
-    select: d => d?.lines ?? [],
   })
 
-  const lines = data ?? []
+  const lines = data?.lines ?? []
+  const hasError = lines.some(l => l.includes('[ERROR]'))
+  const isStuck = projectStatus === 'in_progress' && lines.length <= 1
+
+  // Color-code individual log lines
+  function lineClass(line) {
+    if (line.includes('[ERROR]')) return 'text-red-400'
+    if (line.includes('---')) return 'text-yellow-400'
+    if (line.includes('completed') || line.includes('✓')) return 'text-emerald-400'
+    if (line.includes('WARNING') || line.includes('warn')) return 'text-amber-400'
+    return 'text-purple-300'
+  }
 
   return (
     <div className="card space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-300">🖥️ Agent 实时日志</h2>
-        <span className="flex items-center gap-1.5 text-xs text-emerald-400">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          SSE
+        <span className={`flex items-center gap-1.5 text-xs ${hasError ? 'text-red-400' : 'text-emerald-400'}`}>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${hasError ? 'bg-red-400' : 'bg-emerald-400 animate-pulse'}`} />
+          {hasError ? '有错误' : 'LIVE'}
         </span>
       </div>
-      <pre className="bg-surface-950 rounded-lg p-4 text-xs font-mono text-purple-300
-                      max-h-56 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-surface-700">
-        {lines.length > 0 ? lines.join('\n') : '暂无日志...'}
+
+      {/* Diagnostic banner — shown when agent exits immediately */}
+      {isStuck && (
+        <div className="rounded-lg border border-amber-700/50 bg-amber-900/20 px-4 py-3 space-y-2">
+          <div className="text-amber-400 font-semibold text-sm">⚠️ Agent 无响应</div>
+          <div className="text-xs text-gray-400 space-y-1">
+            <p>日志停止更新，可能是以下原因：</p>
+            <ol className="list-decimal list-inside space-y-0.5 text-gray-500">
+              <li><span className="text-gray-300">Claude CLI 未安装</span>：运行 <code className="bg-surface-800 px-1 rounded">npm install -g @anthropic-ai/claude-code</code></li>
+              <li><span className="text-gray-300">API Key 未配置</span>：检查项目根目录的 <code className="bg-surface-800 px-1 rounded">.env</code> 文件，确认 <code className="bg-surface-800 px-1 rounded">ANTHROPIC_API_KEY=sk-...</code></li>
+              <li><span className="text-gray-300">claude.cmd 不在 PATH</span>：在终端运行 <code className="bg-surface-800 px-1 rounded">claude --version</code> 验证</li>
+            </ol>
+          </div>
+        </div>
+      )}
+
+      {/* Error details banner */}
+      {hasError && (
+        <div className="rounded-lg border border-red-700/50 bg-red-900/20 px-4 py-3">
+          <div className="text-red-400 font-semibold text-sm mb-1">✗ Agent 启动失败</div>
+          <div className="text-xs text-gray-400">
+            查看下方日志获取详细错误信息，修复后可重新点击"🚀 运行此阶段"。
+          </div>
+        </div>
+      )}
+
+      <pre className="bg-surface-950 rounded-lg p-4 text-xs font-mono
+                      max-h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-surface-700">
+        {lines.length > 0
+          ? lines.map((line, i) => (
+              <span key={i} className={lineClass(line)}>{line}{'\n'}</span>
+            ))
+          : <span className="text-gray-600">暂无日志...</span>
+        }
       </pre>
     </div>
   )
