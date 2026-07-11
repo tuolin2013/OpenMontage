@@ -137,15 +137,37 @@ def execute_assets(project_id: str, project_dir: Path) -> dict[str, Any]:
 # ── Internal helpers ──────────────────────────────────────────────────────
 
 def _generate_tts(text: str, out_path: Path) -> dict:
-    """Try ElevenLabs → Doubao → fail."""
+    """Try VoxCPM2 (Modal) → ElevenLabs → Doubao → fail."""
     import os
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── 1. VoxCPM2 (self-hosted on Modal, free, best for Chinese) ──────────
+    if os.environ.get("NEXT_PUBLIC_VOXCPM2_URL"):
+        try:
+            from tools.audio.voxcpm2_tts import VoxCPM2TTS
+            tts = VoxCPM2TTS()
+            # Use a Chinese female voice prompt suitable for ecommerce short video
+            wav_path = out_path.with_suffix(".wav")
+            r = tts.execute({
+                "text": text,
+                "voice_prompt": "声音甜美自然，语速稍快，节奏紧凑，有感染力，适合电商短视频旁白",
+                "cfg_value": 2.0,
+                "timesteps": 10,
+                "output_path": str(wav_path),
+            })
+            if r.success:
+                # Convert wav → mp3 if ffmpeg available, otherwise keep wav
+                final_path = _wav_to_mp3(wav_path, out_path)
+                return {"success": True, "path": str(final_path)}
+            log.warning("VoxCPM2 TTS failed (%s), trying ElevenLabs…", r.error)
+        except Exception as exc:
+            log.warning("VoxCPM2 TTS exception (%s), trying ElevenLabs…", exc)
+
+    # ── 2. ElevenLabs ──────────────────────────────────────────────────────
     if os.environ.get("ELEVENLABS_API_KEY"):
         try:
             from tools.audio.elevenlabs_tts import ElevenLabsTTS
             tts = ElevenLabsTTS()
-            # Use a Chinese-capable multilingual voice
             r = tts.execute({
                 "text": text,
                 "voice_id": "21m00Tcm4TlvDq8ikWAM",  # Rachel — multilingual
@@ -161,6 +183,7 @@ def _generate_tts(text: str, out_path: Path) -> dict:
         except Exception as exc:
             log.warning("ElevenLabs TTS exception (%s), trying Doubao…", exc)
 
+    # ── 3. Doubao ──────────────────────────────────────────────────────────
     if os.environ.get("DOUBAO_SPEECH_API_KEY"):
         try:
             from tools.audio.doubao_tts import DoubaoTTS
@@ -173,6 +196,23 @@ def _generate_tts(text: str, out_path: Path) -> dict:
             log.warning("Doubao TTS exception: %s", exc)
 
     return {"success": False, "error": "All TTS providers failed or unavailable"}
+
+
+def _wav_to_mp3(wav_path: Path, mp3_path: Path) -> Path:
+    """Convert wav to mp3 via ffmpeg if available, otherwise return wav as-is."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-q:a", "2", str(mp3_path)],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode == 0:
+            wav_path.unlink(missing_ok=True)
+            return mp3_path
+    except Exception:
+        pass
+    # ffmpeg not available or failed — return wav
+    return wav_path
 
 
 def _generate_music(style_prompt: str, out_path: Path) -> dict:
