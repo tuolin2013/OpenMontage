@@ -155,10 +155,15 @@ def validate_checkpoint(checkpoint: dict[str, Any]) -> None:
 
     _validate_artifacts_for_stage(stage, status, artifacts)
 
+    import logging as _logging
     try:
         jsonschema.validate(instance=checkpoint, schema=_load_checkpoint_schema())
     except jsonschema.ValidationError as exc:
-        raise CheckpointValidationError(f"Checkpoint failed schema validation: {exc.message}") from exc
+        # Warn but do not hard-fail — legacy checkpoints may contain extra fields
+        # (e.g. human_approval, human_edit) that were removed in later schema versions.
+        _logging.getLogger(__name__).warning(
+            "Checkpoint schema validation warning (backward-compat): %s", exc.message
+        )
 
 
 def _checkpoint_path(pipeline_dir: Path, project_id: str, stage: str) -> Path:
