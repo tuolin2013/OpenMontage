@@ -334,28 +334,59 @@ def _call_llm(
 # ── JSON extraction ───────────────────────────────────────────
 
 def _extract_json(text: str) -> dict:
-    """Extract the first JSON object from LLM response (handles markdown fences)."""
-    # Strip markdown code fences
+    """Extract the first valid JSON object from LLM response.
+
+    Handles:
+    - Markdown code fences (```json ... ```)
+    - Claude <thinking> / <thinking> tags before the JSON
+    - Prose text before or after the JSON block
+    - Unbalanced braces by trying progressively shorter candidates
+    """
+    # 1. Strip XML-style thinking tags (Claude extended-thinking mode)
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+
+    # 2. Strip markdown code fences
     text = re.sub(r"```(?:json)?\s*", "", text)
     text = re.sub(r"```", "", text)
     text = text.strip()
 
-    # Find first { ... } block
-    start = text.find("{")
-    if start == -1:
+    # 3. Try direct parse first (response is already clean JSON)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 4. Find all { ... } candidates and try each
+    candidates = []
+    i = 0
+    while i < len(text):
+        if text[i] == "{":
+            depth = 0
+            for j in range(i, len(text)):
+                if text[j] == "{":
+                    depth += 1
+                elif text[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[i : j + 1])
+                        break
+        i += 1
+
+    if not candidates:
         raise ValueError("No JSON object found in LLM response")
 
-    # Walk to find matching closing brace
-    depth = 0
-    for i, ch in enumerate(text[start:], start=start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : i + 1])
+    # Try candidates from largest to smallest (prefer most complete JSON)
+    candidates.sort(key=len, reverse=True)
+    errors = []
+    for candidate in candidates[:5]:  # try up to 5 candidates
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            errors.append(str(e))
+            continue
 
-    raise ValueError("Unbalanced JSON braces in LLM response")
+    raise ValueError(f"JSON parse failed on all candidates. Errors: {errors[:2]}")
 
 
 # ── System prompt builder ─────────────────────────────────────
