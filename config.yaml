@@ -1,8 +1,10 @@
 # OpenMontage - Global Configuration
 
 llm:
-  provider: anthropic            # anthropic | openai | gemini | openrouter | ollama | mistral | minimax
-  model: null                    # null = use provider default
+  provider: right.codes          # right.codes | anthropic | openai | gemini | openrouter | ollama | mistral | minimax
+  model: null                    # null = use provider default; right.codes supports all major models
+  base_url: https://www.right.codes/codex/v1   # OpenAI-compatible base URL (used when provider = right.codes or openrouter)
+  api_key_env: LLM_API_KEY       # env var that holds the API key (LLM_API_KEY for right.codes)
   temperature: 0.7
   max_tokens: 4096
 
